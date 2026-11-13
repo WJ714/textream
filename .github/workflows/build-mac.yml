@@ -1,0 +1,42 @@
+name: Build Mac app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
+
+      - name: Build
+        run: |
+          cd Textream
+          xcodebuild archive \
+            -project Textream.xcodeproj \
+            -scheme Textream \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/Textream.xcarchive" \
+            -destination "generic/platform=macOS" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            SKIP_INSTALL=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            -quiet
+
+      - name: Sign and zip
+        run: |
+          APP="$RUNNER_TEMP/Textream.xcarchive/Products/Applications/Textream.app"
+          codesign --force --sign - "$APP"
+          ditto -c -k --keepParent "$APP" Textream.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Textream
+          path: Textream.zip
