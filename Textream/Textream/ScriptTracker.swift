@@ -7,8 +7,11 @@
 //  The reading position only ever advances when the speaker has said
 //  consecutive words that are also consecutive in the script:
 //
-//  * While reading, each new word must directly follow the previously
-//    matched word, both in the speech and in the script.
+//  * While reading ("in flow"), each new word must directly follow the
+//    previously matched word, both in the speech and in the script. Here
+//    matching is forgiving — half-finished partial words count, and a single
+//    misheard, dropped or filler word is bridged — so the highlight keeps up
+//    with the voice instead of waiting for the recognizer to settle.
 //  * After going off-script, nothing moves — for as long as it takes — until
 //    two consecutive script words are heard at the place the speaker stopped
 //    (or a little ahead of it, with stricter requirements the further ahead).
@@ -66,6 +69,13 @@ struct ScriptTracker {
     /// Number of words at the start of the current transcript that have
     /// already been used for (or passed over by) an accepted match.
     private var consumedSpokenWords = 0
+    /// True while the word just before `consumedSpokenWords` is known to be
+    /// the script word just before `nextTokenIndex` — i.e. the speaker was
+    /// reading along as of the last matched word.
+    private var isAnchored = false
+    /// Spoken words that had arrived after the last match, as of the most
+    /// recent update.
+    private var pendingSpokenWords = 0
     /// When set, everything currently in the transcript is ignored on the
     /// next update (used when the position changed underneath the tracker).
     private var discardsCurrentTranscript = false
@@ -92,12 +102,19 @@ struct ScriptTracker {
     mutating func jump(toCharOffset charOffset: Int, discardingCurrentTranscript: Bool = false) {
         nextTokenIndex = tokenIndex(forCharOffset: charOffset)
         consumedSpokenWords = 0
+        isAnchored = false
+        pendingSpokenWords = 0
         discardsCurrentTranscript = discardingCurrentTranscript
     }
 
-    /// Call when the recognizer starts a fresh transcript.
+    /// Call when the recognizer starts a fresh transcript. If the speaker was
+    /// reading along at that moment, the first word of the new transcript is
+    /// treated as the continuation, so the periodic recognizer restart does
+    /// not cost a word.
     mutating func resetTranscript() {
+        isAnchored = isAnchored && pendingSpokenWords <= 1
         consumedSpokenWords = 0
+        pendingSpokenWords = 0
         discardsCurrentTranscript = false
     }
 
@@ -116,12 +133,15 @@ struct ScriptTracker {
         if discardsCurrentTranscript {
             discardsCurrentTranscript = false
             consumedSpokenWords = spoken.count
+            isAnchored = false
+            pendingSpokenWords = 0
             return nil
         }
         if spoken.count < consumedSpokenWords - 2 {
             // The recognizer dropped the earlier part of the transcript
             // (it does this after a long pause): everything left is new.
             consumedSpokenWords = 0
+            isAnchored = false
         } else {
             // A revision merged a word or two.
             consumedSpokenWords = min(consumedSpokenWords, spoken.count)
@@ -139,12 +159,66 @@ struct ScriptTracker {
 
         var advanced = false
         while nextTokenIndex < tokens.count,
-              let candidate = bestCandidate(in: spoken) {
+              let candidate = flowCandidate(in: spoken) ?? bestCandidate(in: spoken) {
             nextTokenIndex = candidate.scriptEnd + 1
             consumedSpokenWords = candidate.spokenEnd + 1
+            isAnchored = true
             advanced = true
         }
+        pendingSpokenWords = spoken.count - consumedSpokenWords
         return advanced ? tokens[nextTokenIndex - 1].endOffset : nil
+    }
+
+    /// Fast path while the speaker is reading along: looks only at the one or
+    /// two words spoken directly after the last matched word, and only at
+    /// the next one or two script words.
+    private func flowCandidate(in spoken: [String]) -> Candidate? {
+        guard isAnchored else { return nil }
+        let position = nextTokenIndex
+        let first = consumedSpokenWords
+        guard first < spoken.count, position < tokens.count else { return nil }
+
+        // The next word, heard loosely (partial or slightly misheard).
+        if Self.looselyMatches(script: tokens[position].text, spoken: spoken[first]) {
+            return Candidate(distance: 0, scriptEnd: position, spokenEnd: first)
+        }
+        let hasSecondWord = first + 1 < spoken.count
+        let hasSecondToken = position + 1 < tokens.count
+        // One misheard word: the word after it is right.
+        if hasSecondWord, hasSecondToken,
+           Self.isSolidMatch(script: tokens[position + 1], spoken: spoken[first + 1]) {
+            return Candidate(distance: 0, scriptEnd: position + 1, spokenEnd: first + 1)
+        }
+        // One word the recognizer dropped.
+        if hasSecondToken,
+           Self.isSolidMatch(script: tokens[position + 1], spoken: spoken[first]) {
+            return Candidate(distance: 0, scriptEnd: position + 1, spokenEnd: first)
+        }
+        // One filler word ("um") before the next word.
+        if hasSecondWord,
+           Self.isSolidMatch(script: tokens[position], spoken: spoken[first + 1]) {
+            return Candidate(distance: 0, scriptEnd: position, spokenEnd: first + 1)
+        }
+        return nil
+    }
+
+    /// An exact match on a word distinctive enough to bridge a one-word gap.
+    private static func isSolidMatch(script token: Token, spoken: String) -> Bool {
+        token.text == spoken && (token.text.count >= 4 || token.weight == 1)
+    }
+
+    /// Forgiving comparison used only for the very next expected word.
+    private static func looselyMatches(script: String, spoken: String) -> Bool {
+        if script == spoken { return true }
+        let shorter = min(script.count, spoken.count)
+        guard shorter >= 3 else { return false }
+        if script.hasPrefix(spoken) || spoken.hasPrefix(script) { return true }
+        let sharedPrefix = zip(script, spoken).prefix(while: { $0 == $1 }).count
+        if sharedPrefix >= max(3, shorter * 3 / 5) { return true }
+        let distance = editDistance(script, spoken)
+        if shorter <= 4 { return distance <= 1 }
+        if shorter <= 8 { return distance <= 2 }
+        return distance <= max(script.count, spoken.count) / 3
     }
 
     /// Finds the best run of consecutive spoken words that matches
